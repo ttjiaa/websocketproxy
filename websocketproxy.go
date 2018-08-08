@@ -189,13 +189,15 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	defer connPub.Close()
 
-	errClient := make(chan error, 1)
-	errBackend := make(chan error, 1)
+	errClientSrc := make(chan error, 1)
+	errClientDst := make(chan error, 1)
+	errBackendSrc := make(chan error, 1)
+	errBackendDst := make(chan error, 1)
 	if w.done == nil {
 		w.done = make(chan struct{})
 	}
 
-	replicateWebsocketConn := func(dst, src *websocket.Conn, errc chan error) {
+	replicateWebsocketConn := func(dst, src *websocket.Conn, errcDst, errcSrc chan error) {
 		websocketMsgRcverC := make(chan websocketMsg, 1)
 		websocketMsgRcver := func() <-chan websocketMsg {
 			msgType, msg, err := src.ReadMessage()
@@ -220,7 +222,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 							}
 						}
 					}
-					errc <- websocketMsgRcv.err
+					errcSrc <- websocketMsgRcv.err
 					if m != nil {
 						dst.WriteMessage(websocket.CloseMessage, m)
 					}
@@ -228,7 +230,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				}
 				err = dst.WriteMessage(websocketMsgRcv.msgType, websocketMsgRcv.msg)
 				if err != nil {
-					errc <- err
+					errcDst <- err
 					break
 				}
 			case <-w.done:
@@ -237,18 +239,18 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	go replicateWebsocketConn(connPub, connBackend, errClient)
-	go replicateWebsocketConn(connBackend, connPub, errBackend)
+	go replicateWebsocketConn(connPub, connBackend, errClientDst, errClientSrc)
+	go replicateWebsocketConn(connBackend, connPub, errBackendDst, errBackendSrc)
 
 	select {
-	case err = <-errClient:
-		if e, ok := err.(*websocket.CloseError); !ok || e.Code == websocket.CloseAbnormalClosure {
-			log.Printf("websocketproxy: Error when copying from backend to client: %v", err)
-		}
-	case err = <-errBackend:
-		if e, ok := err.(*websocket.CloseError); !ok || e.Code == websocket.CloseAbnormalClosure {
-			log.Printf("websocketproxy: Error when copying from client to backend: %v", err)
-		}
+	case err = <-errClientSrc:
+		logIfAbnormalClosure("websocketproxy: Error when copying from backend to client, when reading from backend: %v", err)
+	case err = <-errClientDst:
+		logIfAbnormalClosure("websocketproxy: Error when copying from backend to client, when writing to client: %v", err)
+	case err = <-errBackendSrc:
+		logIfAbnormalClosure("websocketproxy: Error when copying from client to backend, when reading from client: %v", err)
+	case err = <-errBackendDst:
+		logIfAbnormalClosure("websocketproxy: Error when copying from client to backend, when writing to backend: %v", err)
 	case <-w.done:
 		m := websocket.FormatCloseMessage(websocket.CloseGoingAway, websocketProxyClosingMsg)
 		connPub.WriteMessage(websocket.CloseMessage, m)
@@ -264,6 +266,12 @@ func (w *WebsocketProxy) Shutdown(ctx context.Context) error {
 		close(w.done)
 	}
 	return nil
+}
+
+func logIfAbnormalClosure(msg string, err error) {
+	if e, ok := err.(*websocket.CloseError); !ok || e.Code == websocket.CloseAbnormalClosure {
+		log.Printf(msg, err)
+	}
 }
 
 func copyHeader(dst, src http.Header) {
